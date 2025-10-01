@@ -1,5 +1,4 @@
 import runpod
-# from runpod.serverless.utils import rp_upload
 import os
 import websocket
 import base64
