@@ -8,7 +8,7 @@ import uuid
 import logging
 import urllib.request
 import urllib.parse
-import binascii  # Импорт для обработки ошибок Base64
+import binascii
 import subprocess
 import time
 import librosa
