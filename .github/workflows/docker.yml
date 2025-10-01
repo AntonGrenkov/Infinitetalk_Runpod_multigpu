@@ -29,7 +29,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/my-image
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/infinitetalk-multigpu
           tags: |
             # latest — только для main
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
@@ -50,5 +50,5 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/my-image:buildcache
-          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/my-image:buildcache,mode=max
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/infinitetalk-multigpu:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/infinitetalk-multigpu:buildcache,mode=max
