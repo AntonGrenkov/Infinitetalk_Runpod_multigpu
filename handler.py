@@ -12,6 +12,9 @@ import binascii  # Импорт для обработки ошибок Base64
 import subprocess
 import time
 import librosa
+import torch
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +22,256 @@ logger = logging.getLogger(__name__)
 
 server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
+
+
+def get_available_gpus():
+    """Определяет количество доступных GPU в системе"""
+    try:
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            logger.info(f"Обнаружено {gpu_count} GPU устройств")
+            for i in range(gpu_count):
+                gpu_name = torch.cuda.get_device_name(i)
+
+                gpu_memory = \
+                    torch.cuda.get_device_properties(i).total_memory / 1024**3
+
+                logger.info(f"GPU {i}: {gpu_name} ({gpu_memory:.1f} GB)")
+            return gpu_count
+        else:
+            logger.warning("CUDA недоступен, используем CPU")
+            return 0
+    except Exception as e:
+        logger.error(f"Ошибка при определении GPU: {e}")
+        return 0
+
+
+def calculate_segments(total_frames, gpu_count, frame_window_size=81):
+    """Вычисляет сегменты для каждого GPU"""
+    if gpu_count <= 1:
+        return [{"start_frame": 0, "end_frame": total_frames, "gpu_id": 0}]
+
+    # Рассчитываем количество кадров на GPU с учетом перекрытия
+    # 50% перекрытие для плавных переходов
+    overlap_frames = frame_window_size // 2
+
+    # Округление вверх
+    frames_per_gpu = (total_frames + gpu_count - 1) // gpu_count
+
+    segments = []
+    for i in range(gpu_count):
+        start_frame = i * frames_per_gpu
+        end_frame = min(
+            start_frame + frames_per_gpu + overlap_frames, total_frames
+        )
+
+        # Корректируем для первого и последнего сегмента
+        if i == 0:
+            start_frame = 0
+        if i == gpu_count - 1:
+            end_frame = total_frames
+
+        segments.append({
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "gpu_id": i,
+            "segment_id": i
+        })
+
+        logger.info(
+            f"GPU {i}: кадры {start_frame}-{end_frame} \
+                ({end_frame - start_frame} кадров)"
+        )
+
+    return segments
+
+
+def create_segment_workflow(base_workflow, segment_info, temp_dir):
+    """Создает отдельный воркфлоу для сегмента"""
+    segment_workflow = json.loads(json.dumps(base_workflow))
+
+    # Настраиваем параметры сегмента
+    segment_workflow["270"]["inputs"]["value"] = \
+        segment_info["end_frame"] - segment_info["start_frame"]
+
+    # Добавляем информацию о сегменте в workflow
+    segment_workflow["_segment_info"] = segment_info
+
+    # Сохраняем workflow для сегмента
+    segment_file = os.path.join(
+        temp_dir,
+        f"workflow_segment_{segment_info['segment_id']}.json"
+    )
+    with open(segment_file, 'w') as f:
+        json.dump(segment_workflow, f, indent=2)
+
+    return segment_file
+
+
+def process_segment_on_gpu(segment_info, workflow_file, temp_dir, gpu_id):
+    """Обрабатывает один сегмент на указанном GPU"""
+    try:
+        # Устанавливаем GPU для текущего потока
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+
+        # Создаем отдельный ComfyUI процесс для этого GPU
+        segment_output_dir = os.path.join(
+            temp_dir,
+            f"segment_{segment_info['segment_id']}"
+        )
+        os.makedirs(segment_output_dir, exist_ok=True)
+
+        # Запускаем ComfyUI с портом для этого сегмента
+        port = 8188 + segment_info['segment_id']
+
+        logger.info(
+            f"Запуск ComfyUI для сегмента \
+                {segment_info['segment_id']} на GPU {gpu_id}, порт {port}"
+        )
+
+        # Команда для запуска ComfyUI
+        comfy_cmd = [
+            'python', '/ComfyUI/main.py',
+            '--listen', '127.0.0.1',
+            '--port', str(port),
+            '--use-sage-attention'
+        ]
+
+        # Запускаем ComfyUI в фоне
+        comfy_process = subprocess.Popen(
+            comfy_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd='/ComfyUI'
+        )
+
+        # Ждем готовности ComfyUI
+        max_wait = 60
+        wait_count = 0
+        while wait_count < max_wait:
+            try:
+                response = urllib.request.urlopen(
+                    f'http://127.0.0.1:{port}/',
+                    timeout=5
+                )
+                if response.getcode() == 200:
+                    logger.info(
+                        f"ComfyUI готов для сегмента \
+                            {segment_info['segment_id']}"
+                    )
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+            wait_count += 2
+
+        if wait_count >= max_wait:
+            raise Exception(
+                f"ComfyUI не запустился для сегмента \
+                    {segment_info['segment_id']}"
+            )
+
+        # Обрабатываем сегмент
+        result = process_single_segment(
+            segment_info,
+            workflow_file,
+            port,
+            segment_output_dir
+        )
+
+        # Завершаем ComfyUI процесс
+        comfy_process.terminate()
+        comfy_process.wait()
+
+        return result
+
+    except Exception as e:
+        logger.error(
+            f"Ошибка обработки сегмента {segment_info['segment_id']}: {e}"
+        )
+        return None
+
+
+def process_single_segment(segment_info, workflow_file, port, output_dir):
+    """Обрабатывает один сегмент через ComfyUI API"""
+    try:
+        # Загружаем workflow
+        with open(workflow_file, 'r') as f:
+            workflow = json.load(f)
+
+        # Отправляем задачу в ComfyUI
+        client_id = str(uuid.uuid4())
+        url = f"http://127.0.0.1:{port}/prompt"
+        data = json.dumps(
+            {"prompt": workflow, "client_id": client_id}
+        ).encode('utf-8')
+
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={'Content-Type': 'application/json'}
+        )
+        response = urllib.request.urlopen(request, timeout=30)
+
+        if response.getcode() != 200:
+            raise Exception(f"Ошибка отправки задачи: {response.getcode()}")
+
+        result = json.loads(response.read())
+        prompt_id = result['prompt_id']
+
+        # Ждем завершения обработки
+        while True:
+            history_url = f"http://127.0.0.1:{port}/history/{prompt_id}"
+            response = urllib.request.urlopen(history_url, timeout=10)
+            history = json.loads(response.read())
+
+            if prompt_id in history:
+                outputs = history[prompt_id]['outputs']
+                if outputs:
+                    # Ищем результат
+                    for node_id, node_output in outputs.items():
+                        if 'gifs' in node_output:
+                            return node_output['gifs']
+            time.sleep(1)
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки сегмента: {e}")
+        return None
+
+
+def merge_video_segments(segment_files, output_path, temp_dir):
+    """Склеивает сегменты видео в один файл"""
+    try:
+        if len(segment_files) == 1:
+            # Если только один сегмент, просто копируем
+            shutil.copy2(segment_files[0], output_path)
+            return output_path
+
+        # Создаем список файлов для ffmpeg
+        concat_file = os.path.join(temp_dir, "concat_list.txt")
+        with open(concat_file, 'w') as f:
+            for segment_file in segment_files:
+                f.write(f"file '{segment_file}'\n")
+
+        # Склеиваем видео с помощью ffmpeg
+        cmd = [
+            'ffmpeg', '-f', 'concat', '-safe', '0', '-i', concat_file,
+            '-c', 'copy', '-y', output_path
+        ]
+
+        logger.info(f"Склеивание сегментов: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logger.error(f"Ошибка ffmpeg: {result.stderr}")
+            raise Exception(f"Ошибка склеивания видео: {result.stderr}")
+
+        logger.info(f"Видео успешно склеено: {output_path}")
+        return output_path
+
+    except Exception as e:
+        logger.error(f"Ошибка склеивания сегментов: {e}")
+        raise
 
 
 def download_file_from_url(url, output_path):
@@ -269,11 +522,163 @@ def calculate_max_frames_from_audio(wav_path, wav_path_2=None, fps=25):
     return max_frames
 
 
+def process_with_multi_gpu(job_input, task_id, input_type, person_count,
+                           media_path, wav_path, wav_path_2, prompt_text,
+                           width, height, max_frame, gpu_count):
+    """Основная функция для мульти-GPU обработки"""
+    try:
+        # Создаем временную директорию для задачи
+        temp_dir = os.path.abspath(task_id)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Выбираем workflow
+        if input_type == "image":
+            if person_count == "single":
+                workflow_path = "I2V_single.json"
+            else:
+                workflow_path = "I2V_multi.json"
+        else:
+            if person_count == "single":
+                workflow_path = "V2V_single.json"
+            else:
+                workflow_path = "V2V_multi.json"
+
+        # Загружаем базовый workflow
+        base_workflow = load_workflow(workflow_path)
+
+        # Настраиваем общие параметры
+        base_workflow["125"]["inputs"]["audio"] = wav_path
+        base_workflow["241"]["inputs"]["positive_prompt"] = prompt_text
+        base_workflow["245"]["inputs"]["value"] = width
+        base_workflow["246"]["inputs"]["value"] = height
+
+        if input_type == "image":
+            base_workflow["284"]["inputs"]["image"] = media_path
+        else:
+            base_workflow["228"]["inputs"]["video"] = media_path
+
+        # Настраиваем второй аудио для multi person
+        if person_count == "multi":
+            if input_type == "image":
+                if "307" in base_workflow:
+                    base_workflow["307"]["inputs"]["audio"] = wav_path_2
+            else:
+                if "313" in base_workflow:
+                    base_workflow["313"]["inputs"]["audio"] = wav_path_2
+
+        # Вычисляем сегменты
+        segments = calculate_segments(max_frame, gpu_count)
+        logger.info(f"Создано {len(segments)} сегментов для обработки")
+
+        # Создаем workflow файлы для каждого сегмента
+        segment_workflows = []
+        for segment in segments:
+            workflow_file = create_segment_workflow(
+                base_workflow,
+                segment,
+                temp_dir
+            )
+            segment_workflows.append((segment, workflow_file))
+
+        # Запускаем параллельную обработку сегментов
+        segment_results = []
+        with ThreadPoolExecutor(max_workers=gpu_count) as executor:
+            # Отправляем задачи на каждый GPU
+            future_to_segment = {
+                executor.submit(
+                    process_segment_on_gpu,
+                    segment_info,
+                    workflow_file,
+                    temp_dir,
+                    segment_info['gpu_id']
+                ): segment_info for segment_info, workflow_file
+                in segment_workflows
+            }
+
+            # Собираем результаты
+            for future in as_completed(future_to_segment):
+                segment_info = future_to_segment[future]
+                try:
+                    result = future.result()
+                    if result:
+                        segment_results.append((segment_info, result))
+                        logger.info(
+                            f"Сегмент {segment_info['segment_id']} \
+                                обработан успешно"
+                        )
+                    else:
+                        logger.error(
+                            f"Ошибка обработки сегмента \
+                                {segment_info['segment_id']}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Исключение при обработке сегмента \
+                            {segment_info['segment_id']}: {e}"
+                    )
+
+        if not segment_results:
+            return {"error": "Не удалось обработать ни одного сегмента"}
+
+        # Сортируем результаты по segment_id
+        segment_results.sort(key=lambda x: x[0]['segment_id'])
+
+        # Извлекаем пути к видео файлам
+        segment_video_files = []
+        for segment_info, result in segment_results:
+            if result and len(result) > 0:
+                video_path = result[0]['fullpath']
+                segment_video_files.append(video_path)
+                logger.info(
+                    f"Сегмент {segment_info['segment_id']}: {video_path}"
+                )
+
+        if not segment_video_files:
+            return {"error": "Не найдено видео файлов для склеивания"}
+
+        # Склеиваем все сегменты
+        final_output_path = os.path.join(temp_dir, "final_video.mp4")
+        merge_video_segments(segment_video_files, final_output_path, temp_dir)
+
+        # Читаем финальное видео и кодируем в base64
+        with open(final_output_path, 'rb') as f:
+            video_data = base64.b64encode(f.read()).decode('utf-8')
+
+        # Очищаем временные файлы
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        logger.info(
+            f"Мульти-GPU обработка завершена успешно. \
+                GPU использовано: {gpu_count}"
+        )
+
+        return {
+            "success": True,
+            "video": video_data,
+            "gpu_count": gpu_count,
+            "segments_processed": len(segment_results),
+            "message": f"Видео успешно создано с {gpu_count} GPU"
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка мульти-GPU обработки: {e}")
+        return {"error": f"Ошибка мульти-GPU обработки: {str(e)}"}
+
+
 def handler(job):
     job_input = job.get("input", {})
 
     logger.info(f"Получены входные данные задачи: {job_input}")
     task_id = f"task_{uuid.uuid4()}"
+
+    # Проверяем доступные GPU
+    gpu_count = get_available_gpus()
+    use_multi_gpu = gpu_count > 1 and job_input.get("use_multi_gpu", True)
+
+    if use_multi_gpu:
+        logger.info(f"Используем мульти-GPU режим с {gpu_count} GPU")
+    else:
+        logger.info("Используем однопоточный режим")
 
     # Определение типа ввода и количества персон
     input_type = job_input.get("input_type", "image")  # image/video
@@ -432,6 +837,14 @@ def handler(job):
             width={width}, height={height}, max_frame={max_frame}"
     )
     logger.info(f"Путь к медиа: {media_path}")
+
+    # Если используем мульти-GPU, переходим к параллельной обработке
+    if use_multi_gpu:
+        return process_with_multi_gpu(
+            job_input, task_id, input_type, person_count,
+            media_path, wav_path, wav_path_2, prompt_text,
+            width, height, max_frame, gpu_count
+        )
     logger.info(f"Путь к аудио: {wav_path}")
     if person_count == "multi":
         logger.info(f"Путь ко второму аудио: {wav_path_2}")
